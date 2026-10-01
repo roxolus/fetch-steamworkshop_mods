@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Usage: ./fetch_subscribed.sh <appid> [firefox_profile_dir]
+# Usage: ./fetch_subscribed.sh [-missing] [-c|--copy] [--acf FILE] <appid> [firefox_profile_dir]
+#
+#   -missing, --missing   Only output mods that are NOT already listed in the
+#                         game's appworkshop_<appid>.acf (i.e. not installed).
+#                         Writes ~/Downloads/<appid>_missing.txt instead.
+#   -c, --copy            Copy the links to the clipboard instead of writing a
+#                         file (uses wl-copy on Wayland, xclip/xsel on X11).
+#   --acf FILE            Use this .acf file instead of auto-locating it.
 #
 # Pulls the steamLoginSecure session cookie out of Firefox, uses it to
 # fetch every page of
@@ -27,16 +34,108 @@ step() { printf '\n== %s ==\n' "$*" >&2; }
 ok()   { printf '  [ok] %s\n' "$*" >&2; }
 no()   { printf '  [--] %s\n' "$*" >&2; }
 
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <appid> [firefox_profile_dir]" >&2
+usage() {
+    echo "Usage: $0 [-missing] [-c|--copy] [--acf FILE] <appid> [firefox_profile_dir]" >&2
+}
+
+missing_only=0
+copy_mode=0
+acf_override=""
+positional=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -missing|--missing|-m) missing_only=1 ;;
+        -c|--copy) copy_mode=1 ;;
+        --acf)
+            shift
+            acf_override="${1:-}"
+            [ -n "$acf_override" ] || { echo "--acf needs a file path" >&2; exit 1; }
+            ;;
+        -h|--help) usage; exit 0 ;;
+        -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        *) positional+=("$1") ;;
+    esac
+    shift
+done
+
+if [ ${#positional[@]} -lt 1 ]; then
+    usage
     exit 1
 fi
 
-appid="$1"
-profile_dir_override="${2:-}"
+appid="${positional[0]}"
+profile_dir_override="${positional[1]:-}"
 
 command -v sqlite3 >/dev/null || { say "sqlite3 not found — install it with: sudo dnf install sqlite"; exit 1; }
 command -v curl    >/dev/null || { say "curl not found — install it with: sudo dnf install curl"; exit 1; }
+
+# Pick a clipboard tool. Sets the CLIP_CMD array (empty on failure).
+# Prefers whatever matches the current session type, then tries the rest.
+detect_clipboard() {
+    CLIP_CMD=()
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null; then
+        CLIP_CMD=(wl-copy)
+    elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null; then
+        CLIP_CMD=(xclip -selection clipboard)
+    elif [ -n "${DISPLAY:-}" ] && command -v xsel >/dev/null; then
+        CLIP_CMD=(xsel --clipboard --input)
+    elif command -v wl-copy >/dev/null; then
+        CLIP_CMD=(wl-copy)
+    elif command -v xclip >/dev/null; then
+        CLIP_CMD=(xclip -selection clipboard)
+    elif command -v xsel >/dev/null; then
+        CLIP_CMD=(xsel --clipboard --input)
+    fi
+}
+
+# Locate steamapps/workshop/appworkshop_<appid>.acf across Steam installs
+# (native, Flatpak, Snap) and every extra library folder in libraryfolders.vdf.
+find_acf() {
+    local appid="$1" r f lib
+    local roots=(
+        "$HOME/.local/share/Steam"
+        "$HOME/.steam/steam"
+        "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+        "$HOME/snap/steam/common/.local/share/Steam"
+    )
+    local libs=()
+
+    for r in "${roots[@]}"; do
+        [ -d "$r/steamapps" ] || continue
+        libs+=("$r")
+        f="$r/steamapps/libraryfolders.vdf"
+        if [ -f "$f" ]; then
+            while IFS= read -r lib; do
+                [ -n "$lib" ] && libs+=("$lib")
+            done < <(grep -oP '^\s*"path"\s+"\K[^"]+' "$f" || true)
+        fi
+    done
+
+    for lib in "${libs[@]}"; do
+        f="$lib/steamapps/workshop/appworkshop_${appid}.acf"
+        if [ -f "$f" ]; then
+            echo "$f"
+            return 0
+        fi
+        say "  checked: $f (not there)"
+    done
+    return 1
+}
+
+# Print workshop item IDs listed under WorkshopItemsInstalled in an .acf.
+# Falls back to every bare-numeric key in the file if that section is absent.
+read_acf_ids() {
+    local acf="$1" ids
+    ids=$(awk '
+        /"WorkshopItemsInstalled"/ { in_s=1; next }
+        /"WorkshopItemDetails"/    { in_s=0; next }
+        in_s && /^[ \t]*"[0-9]+"[ \t\r]*$/ { gsub(/[^0-9]/, ""); print }
+    ' "$acf" | sort -u)
+    if [ -z "$ids" ]; then
+        ids=$(grep -oP '^\s*"\K[0-9]+(?="\s*\r?$)' "$acf" | sort -u || true)
+    fi
+    printf '%s\n' "$ids"
+}
 
 # Figure out which profile folder is "the" default one inside a Firefox
 # base dir, using installs.ini / profiles.ini, falling back to a lone
@@ -109,6 +208,33 @@ extract_cookie() {
 
     rm -rf "$tmp"
 }
+
+CLIP_CMD=()
+if [ "$copy_mode" -eq 1 ]; then
+    detect_clipboard
+    if [ ${#CLIP_CMD[@]} -eq 0 ]; then
+        say "No clipboard tool found. Install one:"
+        say "  Wayland: sudo dnf install wl-clipboard"
+        say "  X11:     sudo dnf install xclip"
+        exit 1
+    fi
+fi
+
+installed_ids=""
+if [ "$missing_only" -eq 1 ]; then
+    step "Locating appworkshop_${appid}.acf"
+    if [ -n "$acf_override" ]; then
+        acf_file="$acf_override"
+        [ -f "$acf_file" ] || { say "  [--] file not found: $acf_file"; exit 1; }
+    elif ! acf_file=$(find_acf "$appid"); then
+        say "  [--] couldn't find appworkshop_${appid}.acf in any Steam library."
+        say "       Pass it explicitly with: --acf /path/to/appworkshop_${appid}.acf"
+        exit 1
+    fi
+    ok "using $acf_file"
+    installed_ids=$(read_acf_ids "$acf_file")
+    ok "$(printf '%s\n' "$installed_ids" | grep -c . || true) installed item(s) listed in the .acf"
+fi
 
 FOUND_PROFILE=""
 FOUND_LABEL=""
@@ -240,8 +366,18 @@ step "Fetching subscribed items for appid $appid"
 fetch_tmp=$(mktemp -d)
 trap 'rm -rf "$fetch_tmp"' EXIT
 
-mkdir -p "$HOME/Downloads"
-outfile="$HOME/Downloads/${appid}_subscribed.txt"
+if [ "$copy_mode" -eq 1 ]; then
+    # temp file only; deleted on exit by the trap
+    outfile="$fetch_tmp/clipboard.txt"
+else
+    mkdir -p "$HOME/Downloads"
+    if [ "$missing_only" -eq 1 ]; then
+        outfile="$HOME/Downloads/${appid}_missing.txt"
+    else
+        outfile="$HOME/Downloads/${appid}_subscribed.txt"
+    fi
+fi
+all_file="$fetch_tmp/all_links.txt"
 
 page=1
 max_pages=20
@@ -289,11 +425,26 @@ while [ "$page" -le "$max_pages" ]; do
 done
 
 grep -hoP 'filedetails/\?id=\K[0-9]+' "$fetch_tmp"/page_*.html 2>/dev/null | sort -un | \
-    awk '{print "https://steamcommunity.com/sharedfiles/filedetails/?id="$1}' > "$outfile"
+    awk '{print "https://steamcommunity.com/sharedfiles/filedetails/?id="$1}' > "$all_file" || true
+[ -f "$all_file" ] || : > "$all_file"
+
+total=$(wc -l < "$all_file")
+
+if [ "$missing_only" -eq 1 ]; then
+    # leading "0" line keeps awk's NR==FNR trick working if the list is empty
+    printf '0\n%s\n' "$installed_ids" > "$fetch_tmp/installed.txt"
+    awk 'NR==FNR { have[$1]=1; next }
+         { id=$0; sub(/.*id=/, "", id); if (!(id in have)) print }' \
+        "$fetch_tmp/installed.txt" "$all_file" > "$outfile"
+    say ""
+    say "Subscribed: $total | already in .acf: $((total - $(wc -l < "$outfile"))) | missing: $(wc -l < "$outfile")"
+else
+    cp "$all_file" "$outfile"
+fi
 
 count=$(wc -l < "$outfile")
 
-if [ "$count" -eq 0 ]; then
+if [ "$count" -eq 0 ] && [ "$missing_only" -eq 0 ] || { [ "$total" -eq 0 ] && [ "$missing_only" -eq 1 ]; }; then
     say ""
     say "Session was valid but 0 items were found. Possible causes:"
     say "  - wrong appid ($appid)"
@@ -301,4 +452,14 @@ if [ "$count" -eq 0 ]; then
     say "  - the session cookie is stale (reload steamcommunity.com in Firefox and retry)"
 fi
 
-echo "Wrote $count link(s) to $outfile"
+if [ "$copy_mode" -eq 1 ]; then
+    if [ "$count" -eq 0 ]; then
+        # don't clobber whatever is on the clipboard with nothing
+        echo "Nothing to copy (0 links) — clipboard left untouched"
+    else
+        "${CLIP_CMD[@]}" < "$outfile"
+        echo "Copied $count link(s) to clipboard (${CLIP_CMD[0]})"
+    fi
+else
+    echo "Wrote $count link(s) to $outfile"
+fi
